@@ -4,42 +4,45 @@ import { extension_settings, loadExtensionSettings, getContext, renderExtensionT
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
 import { getTokenCountAsync } from '../../../tokenizers.js';
 
-
 (function () {
     // --- 插件基础信息 ---
-    const extensionName = "day4";
-    const pluginFolderName = "day4"; // 与你的文件夹名称匹配
+    const extensionName = "day2";
+    const pluginFolderName = "day2";
     const extensionFolderPath = `scripts/extensions/third-party/${pluginFolderName}`;
     const extensionSettings = extension_settings[extensionName] || {};
     const defaultSettings = {};
 
     // --- 插件状态变量 ---
     let day1Worker;
+    // Prompt Token 追踪
+    let lastCalculatedPromptTokens = 0;
+    let lastUsedApi = '';
+    let pendingTokenConsumptionLog = false;
+    // 时长追踪
+    let lastVisibleTimestamp = null;
     let currentEntityId = null;
     let currentEntityName = null;
-    // **新增：用于追踪待确认消耗的 Prompt Token 的状态变量**
-    let lastCalculatedPromptTokens = 0;
-    let lastUsedApi = ''; // 记录计算时使用的 API 类型
-    let pendingTokenConsumptionLog = false; // 关键标志位，true表示已预计算Token，等待API成功响应
+    let entityStartTime = null;
 
-    // --- IndexedDB 相关 ---
+    const GLOBAL_STATS_ID = '_GLOBAL_STATS_';
+
+    // --- IndexedDB 相关 (保持不变) ---
     const DB_NAME = 'SillyTavernDay1Stats';
     const STORE_NAME = 'dailyStats';
     const DB_VERSION = 1;
     let dbInstance;
 
-    // --- IndexedDB 函数 (保持不变) ---
     function openDBMain() {
         return new Promise((resolve, reject) => {
             if (dbInstance) { resolve(dbInstance); return; }
-            console.log(`[${extensionName}] Main: Attempting to open IndexedDB...`);
+            // console.log(`[${extensionName}] Main: Opening IndexedDB...`);
             const request = indexedDB.open(DB_NAME, DB_VERSION);
             request.onerror = (event) => { console.error(`[${extensionName}] Main: IndexedDB open error:`, event.target.error); reject('IndexedDB error: ' + event.target.error); };
             request.onsuccess = (event) => {
                 dbInstance = event.target.result;
-                console.log(`[${extensionName}] Main: IndexedDB connection opened successfully.`);
+                // console.log(`[${extensionName}] Main: IndexedDB connection opened.`);
                 dbInstance.onerror = (event) => console.error(`[${extensionName}] Main: Database error:`, event.target.error);
-                dbInstance.onclose = () => { console.log(`[${extensionName}] Main: Database connection closed.`); dbInstance = null; };
+                dbInstance.onclose = () => { /* console.log(`[${extensionName}] Main: Database connection closed.`); */ dbInstance = null; };
                 dbInstance.onversionchange = () => { console.log(`[${extensionName}] Main: Database version change detected, closing connection.`); if (dbInstance) { dbInstance.close(); dbInstance = null; } };
                 resolve(dbInstance);
             };
@@ -89,11 +92,67 @@ import { getTokenCountAsync } from '../../../tokenizers.js';
         }
     }
 
-    // --- UI 更新 (你需要修改这里来显示 AI 响应时间) ---
+    // --- 时长处理函数 ---
+    function recordVisibleDuration() {
+        if (lastVisibleTimestamp) {
+            const durationMs = Date.now() - lastVisibleTimestamp;
+            if (durationMs > 0) {
+                sendMessageToWorker('recordDailyDuration', {
+                    durationMs: durationMs,
+                    timestamp: Date.now(),
+                });
+            }
+            lastVisibleTimestamp = null;
+        }
+    }
+
+    /** 记录当前活动实体的交互时长片段到 Worker (包含时间戳) */
+    function recordEntityDuration() {
+        if (entityStartTime && currentEntityId) {
+            const durationMs = Date.now() - entityStartTime;
+            if (durationMs > 0) {
+                sendMessageToWorker('recordEntityDuration', {
+                    entityId: currentEntityId,
+                    entityName: currentEntityName,
+                    durationMs: durationMs,
+                    timestamp: Date.now(), // *** 新增：传递时间戳 ***
+                });
+            }
+            entityStartTime = null;
+        }
+    }
+
+    function handleVisibilityChange() {
+        if (document.visibilityState === 'visible') {
+            lastVisibleTimestamp = Date.now();
+            if (currentEntityId) {
+                entityStartTime = Date.now();
+            }
+        } else {
+            recordVisibleDuration();
+            recordEntityDuration();
+        }
+    }
+
+    // --- UI 更新 (需要修改以显示新时长数据) ---
+    function formatDuration(ms) {
+        if (typeof ms !== 'number' || ms <= 0) return '0s';
+        let seconds = Math.floor(ms / 1000);
+        let minutes = Math.floor(seconds / 60);
+        let hours = Math.floor(minutes / 60);
+        seconds %= 60; minutes %= 60;
+        let result = '';
+        if (hours > 0) result += `${hours}h `;
+        if (minutes > 0) result += `${minutes}m `;
+        if (seconds >= 0) result += `${seconds}s`;
+        return result.trim();
+    }
+
     async function updateStatsTable() {
         const tableBody = $('#day1-stats-table-body');
-        if (!tableBody.length) { /* console.warn(`[${extensionName}] Main: Stats table body not found in DOM.`); */ return; }
-        tableBody.empty().append('<tr><td colspan="5"><i>正在加载统计数据...</i></td></tr>'); // 调整 colspan 以适应新列
+        if (!tableBody.length) return;
+        // *** 修改 colspan 以适应新列 ***
+        tableBody.empty().append('<tr><td colspan="8"><i>正在加载统计数据...</i></td></tr>');
 
         try {
             const allStats = await getAllStats();
@@ -101,149 +160,119 @@ import { getTokenCountAsync } from '../../../tokenizers.js';
             tableBody.empty();
 
             if (allStats.length === 0) {
-                tableBody.append('<tr><td colspan="6"><i>暂无任何统计数据。</i></td></tr>'); // 调整 colspan
+                 tableBody.append('<tr><td colspan="8"><i>暂无任何统计数据。</i></td></tr>');
                 return;
             }
 
+            const globalStatEntry = allStats.find(s => s.entityId === GLOBAL_STATS_ID);
+            const dailyGlobalData = globalStatEntry?.dailyData?.[todayString];
+            const todayTotalDurationStr = formatDuration(dailyGlobalData?.totalVisibleDurationMs);
+
             let hasTodayData = false;
-            allStats.sort((a, b) => (a.entityName || a.entityId || '').localeCompare(b.entityName || b.entityId || ''));
+            const entityStatsList = allStats
+                .filter(s => s.entityId !== GLOBAL_STATS_ID)
+                .sort((a, b) => (a.entityName || a.entityId || '').localeCompare(b.entityName || b.entityId || ''));
 
-            allStats.forEach(entityStats => {
+            entityStatsList.forEach(entityStats => {
                 const dailyData = entityStats.dailyData ? entityStats.dailyData[todayString] : null;
-                if (dailyData) {
-                    hasTodayData = true;
 
-                    // --- 计算并格式化平均 AI 响应时间 ---
-                    let avgAiTimeStr = 'N/A';
-                    if (dailyData.aiMessages > 0 && dailyData.totalAiResponseDuration > 0) {
-                        const avgMs = dailyData.totalAiResponseDuration / dailyData.aiMessages;
-                        avgAiTimeStr = `${(avgMs / 1000).toFixed(2)}s`; // 转换为秒，保留两位小数
-                    }
-                    // -----------------------------------
+                const userMessages = dailyData?.userMessages || 0;
+                const userTokens = dailyData?.userTokens || 0;
+                const aiMessages = dailyData?.aiMessages || 0;
+                const aiTokens = dailyData?.aiTokens || 0;
+                const cumulativeTokens = dailyData?.cumulativeTokens || 0;
+                const totalAiDurationMs = dailyData?.totalAiResponseDuration || 0;
+                // *** 读取每日角色/群组时长 ***
+                const dailyEntityDurationMs = dailyData?.dailyInteractionDurationMs || 0;
 
-                    // **你需要修改这里的 HTML 结构以包含新的时间列**
-                    const row = `
-                        <tr>
-                            <td>${entityStats.entityName || entityStats.entityId}</td>
-                            <td>${dailyData.userMessages || 0} (${dailyData.userTokens || 0} tk)</td>
-                            <td>${dailyData.aiMessages || 0} (${dailyData.aiTokens || 0} tk)</td>
-                            <td>${dailyData.cumulativeTokens || 0}</td>
-                            <td>${avgAiTimeStr}</td>  <%-- 新增：平均 AI 响应时间 --%>
-                            <%-- <td>${todayString}</td> --%> <%-- 可能需要调整或移除日期列 --%>
-                        </tr>
-                    `;
-                    tableBody.append(row);
+                let avgAiTimeStr = 'N/A';
+                if (aiMessages > 0 && totalAiDurationMs > 0) {
+                    avgAiTimeStr = `${(totalAiDurationMs / aiMessages / 1000).toFixed(2)}s`;
                 }
+
+                const totalInteractionDurationStr = formatDuration(entityStats.totalInteractionDurationMs);
+                // *** 格式化每日角色/群组时长 ***
+                const dailyEntityDurationStr = formatDuration(dailyEntityDurationMs);
+
+                hasTodayData = hasTodayData || !!dailyData;
+
+                // *** 修改 row 结构以包含所有列 ***
+                const row = `
+                    <tr>
+                        <td>${entityStats.entityName || entityStats.entityId}</td>
+                        <td>${userMessages} (${userTokens} tk)</td>
+                        <td>${aiMessages} (${aiTokens} tk)</td>
+                        <td>${cumulativeTokens} tk</td>             <%-- Prompt Tokens --%>
+                        <td>${avgAiTimeStr}</td>                   <%-- 平均 AI 响应时间 --%>
+                        <td>${dailyEntityDurationStr}</td>        <%-- 新增：角色/群组今日时长 --%>
+                        <td>${totalInteractionDurationStr}</td>   <%-- 角色/群组总时长 --%>
+                        <td>${todayTotalDurationStr}</td>         <%-- 今日总在线时长 --%>
+                    </tr>
+                `;
+                tableBody.append(row);
             });
 
-            if (!hasTodayData) {
-                 tableBody.append(`<tr><td colspan="6"><i>今天 (${todayString}) 还没有聊天记录。</i></td></tr>`); // 调整 colspan
+            if (!hasTodayData && entityStatsList.length === 0) {
+                 tableBody.append(`<tr><td colspan="8"><i>今天 (${todayString}) 还没有聊天记录。</i></td></tr>`);
             }
 
         } catch (error) {
             console.error(`[${extensionName}] Main: Error fetching or updating stats table:`, error);
-            tableBody.empty().append('<tr><td colspan="6"><i style="color: red;">加载统计数据失败，请检查控制台。</i></td></tr>'); // 调整 colspan
+            tableBody.empty().append('<tr><td colspan="8"><i style="color: red;">加载统计数据失败，请检查控制台。</i></td></tr>');
         }
     }
 
-    // --- 事件处理 ---
 
-    /**
-     * 处理单条消息（用户或 AI），计算 Token/时长 并发送给 Worker 进行记录。
-     * @param {object} message SillyTavern 的消息对象。
-     * @param {boolean} isUser 标记消息是否由用户发送。
-     */
+    // --- 事件处理 (handleMessage, onMessageSent 保持不变) ---
     async function handleMessage(message, isUser) {
-        if (!message || !currentEntityId) {
-            return;
-        }
-
+        if (!message || !currentEntityId) return;
         let tokenCount = 0;
         try {
-            if (typeof message?.extra?.token_count === 'number' && message.extra.token_count > 0) {
-                tokenCount = message.extra.token_count;
-            } else if (message.mes) {
-                tokenCount = await getTokenCountAsync(message.mes || '', 0);
-            }
-        } catch (err) {
-            console.warn(`[${extensionName}] Main: Failed to get token count for message, estimating...`, err);
-            tokenCount = Math.round((message.mes || '').length / 3.5);
-        }
-
-        // --- 新增：计算 AI 回复时长 ---
+            tokenCount = (typeof message?.extra?.token_count === 'number' && message.extra.token_count > 0)
+                ? message.extra.token_count
+                : (message.mes ? await getTokenCountAsync(message.mes || '', 0) : 0);
+        } catch (err) { tokenCount = Math.round((message.mes || '').length / 3.5); }
         let aiResponseDuration = null;
         if (!isUser && message.gen_finished && message.gen_started) {
             try {
                 const end = new Date(message.gen_finished).getTime();
                 const start = new Date(message.gen_started).getTime();
-                if (!isNaN(end) && !isNaN(start) && end >= start) {
-                    aiResponseDuration = end - start; // 时长，单位：毫秒
-                } else {
-                    console.warn(`[${extensionName}] Invalid timestamps for AI message: started=${message.gen_started}, finished=${message.gen_finished}`);
-                }
-            } catch (e) {
-                console.error(`[${extensionName}] Error calculating AI duration:`, e);
-            }
+                if (!isNaN(end) && !isNaN(start) && end >= start) aiResponseDuration = end - start;
+            } catch (e) { /* ignore */ }
         }
-        // -----------------------------
-
-        const payload = {
-            entityId: currentEntityId,
-            entityName: currentEntityName,
-            isUser: isUser,
-            tokenCount: tokenCount,
-            timestamp: message.send_date || Date.now(),
-            // --- 将计算出的时长添加到 payload ---
-            aiResponseDuration: aiResponseDuration,
-        };
-        sendMessageToWorker('processMessage', payload);
+        sendMessageToWorker('processMessage', {
+            entityId: currentEntityId, entityName: currentEntityName, isUser, tokenCount,
+            timestamp: message.send_date || Date.now(), aiResponseDuration,
+        });
     }
-
-
-    /**
-     * 处理用户发送的消息 (MESSAGE_SENT 事件)
-     */
     function onMessageSent(messageId) {
         const context = getContext();
-        if (!context || !context.chat || !context.chat[messageId]) return;
-        const message = context.chat[messageId];
-        handleMessage(message, true); // 用户消息 isUser = true
+        if (context?.chat?.[messageId]) handleMessage(context.chat[messageId], true);
     }
-
-    /**
-     * 处理聊天上下文变化 (CHAT_CHANGED 事件)
-     */
     function onChatChanged(chatId) {
         const context = getContext();
-        if (!context) {
-            currentEntityId = null;
-            currentEntityName = null;
-            console.log(`[${extensionName}] Main: Chat context cleared.`);
-            return;
+        let newEntityId = null, newEntityName = null;
+        if (context) {
+            if (context.groupId != null) {
+                newEntityId = String(context.groupId);
+                newEntityName = context.groups?.find(g => String(g.id) === newEntityId)?.name || newEntityId;
+            } else if (context.characterId != null && context.characters?.[context.characterId]) {
+                newEntityId = context.characters[context.characterId].avatar;
+                newEntityName = context.characters[context.characterId].name;
+            }
         }
-
-        let newEntityId = null;
-        let newEntityName = null;
-
-        if (context.groupId !== undefined && context.groupId !== null) {
-            newEntityId = String(context.groupId);
-            newEntityName = context.groups?.find(g => String(g.id) === newEntityId)?.name || newEntityId;
-        } else if (context.characterId !== undefined && context.characterId !== null && context.characters && context.characters[context.characterId]) {
-            newEntityId = context.characters[context.characterId].avatar;
-            newEntityName = context.characters[context.characterId].name;
-        }
-
+        if (document.visibilityState === 'visible') recordEntityDuration();
         if (newEntityId !== currentEntityId) {
             currentEntityId = newEntityId;
             currentEntityName = newEntityName;
-            console.log(`[${extensionName}] Main: Chat context changed. Current entity: ${currentEntityName || 'None'} (ID: ${currentEntityId || 'None'})`);
-            pendingTokenConsumptionLog = false;
-            lastCalculatedPromptTokens = 0;
-            lastUsedApi = '';
-            // 切换聊天时，也刷新一次表格显示新角色/群组的统计
+            entityStartTime = (document.visibilityState === 'visible' && currentEntityId) ? Date.now() : null;
+            pendingTokenConsumptionLog = false; lastCalculatedPromptTokens = 0; lastUsedApi = '';
             updateStatsTable();
+        } else if (newEntityId === null && currentEntityId !== null) {
+             currentEntityId = null; currentEntityName = null; entityStartTime = null;
         }
     }
+
 
     // --- 插件初始化 ---
     jQuery(async () => {
@@ -251,143 +280,57 @@ import { getTokenCountAsync } from '../../../tokenizers.js';
         extension_settings[extensionName] = extension_settings[extensionName] || {};
         Object.assign(extension_settings[extensionName], { ...defaultSettings, ...extension_settings[extensionName] });
 
-        // 初始化 IndexedDB
-        try {
-            await openDBMain();
-            console.log(`[${extensionName}] Main: Initial DB connection/setup successful.`);
-        } catch (error) {
-            console.error(`[${extensionName}] Main: Critical - Failed initial DB open/setup:`, error);
-        }
-
-        // 注入设置 UI
+        try { await openDBMain(); } catch (error) { console.error(`[${extensionName}] Main: DB init failed:`, error); }
         try {
             const settingsHtml = await renderExtensionTemplateAsync(`third-party/${pluginFolderName}`, 'settings_display');
             const targetContainer = $('#extensions_settings') || $('#extension_settings') || $('body');
             if (targetContainer.length) {
                 targetContainer.append(settingsHtml);
-                console.log(`[${extensionName}] Main: Settings UI injected.`);
                 $('#day1-refresh-button').on('click', updateStatsTable);
                 setTimeout(updateStatsTable, 500);
-            } else {
-                console.warn(`[${extensionName}] Main: Could not find suitable container (#extensions_settings) for settings UI.`);
             }
-        } catch (error) {
-            console.error(`[${extensionName}] Main: Error loading or injecting settings HTML: ${error}`);
-        }
-
-        // 初始化 Web Worker
+        } catch (error) { console.error(`[${extensionName}] Main: Error loading settings UI:`, error); }
         try {
             const workerPath = `${extensionFolderPath}/worker.js`;
             day1Worker = new Worker(workerPath);
-            day1Worker.onmessage = (event) => { /* console.log(`[${extensionName}] Main: Received message from worker:`, event.data); */ };
-            day1Worker.onerror = (error) => {
-                console.error(`[${extensionName}] Main: Worker error reported:`, error.message, error);
-            };
-            console.log(`[${extensionName}] Main: Web Worker initialized successfully from path: ${workerPath}`);
-        } catch (error) {
-            console.error(`[${extensionName}] Main: Failed to initialize Web Worker from path "${extensionFolderPath}/worker.js":`, error);
-            alert(`${extensionName} 插件未能成功加载后台处理程序，统计功能将不可用。`);
-            day1Worker = null;
-        }
+            day1Worker.onerror = (error) => { console.error(`[${extensionName}] Worker error:`, error.message, error); };
+            console.log(`[${extensionName}] Main: Web Worker initialized.`);
+        } catch (error) { console.error(`[${extensionName}] Main: Failed to initialize Worker:`, error); day1Worker = null; }
 
         // --- 注册核心事件监听器 ---
-
-        // 监听用户发送消息
         eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
-
-        // 监听聊天切换
         eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-
-        // **新增：监听准备好发送给 API 的数据 (GENERATE_AFTER_DATA) - 用于预计算 Prompt Token**
         eventSource.on(event_types.GENERATE_AFTER_DATA, async (generateData) => {
             const context = getContext();
             const currentApi = generateData.type || context.mainApi || mainApi;
-            let promptTokens = 0;
-
-            if (generateData.dryRun || !currentEntityId) {
-                return;
-            }
-
+            if (generateData.dryRun || !currentEntityId) return;
             try {
+                let promptTokens = 0;
                 if (currentApi === 'openai' || generateData.is_openai) {
-                    const messages = generateData.prompt;
-                    if (Array.isArray(messages)) {
-                        const tokenPromises = messages.map(message =>
-                            getTokenCountAsync(message.content || '', 0)
-                        );
-                        const tokensPerMessage = await Promise.all(tokenPromises);
-                        promptTokens = tokensPerMessage.reduce((sum, count) => sum + count, 0);
-                    } else { console.warn(`[${extensionName}] OpenAI generateData.prompt 格式非预期数组:`, messages); }
-                } else {
-                    const promptString = generateData.prompt;
-                    if (typeof promptString === 'string') {
-                        const padding = typeof power_user === 'object' ? (power_user.token_padding || 0) : 0;
-                        promptTokens = await getTokenCountAsync(promptString, padding);
-                    } else { console.warn(`[${extensionName}] ${currentApi} generateData.prompt 格式非预期字符串:`, promptString); }
+                    if (Array.isArray(generateData.prompt)) promptTokens = (await Promise.all(generateData.prompt.map(m => getTokenCountAsync(m.content || '', 0)))).reduce((s, c) => s + c, 0);
+                } else if (typeof generateData.prompt === 'string') {
+                    promptTokens = await getTokenCountAsync(generateData.prompt, power_user?.token_padding || 0);
                 }
-
-                lastCalculatedPromptTokens = promptTokens;
-                lastUsedApi = currentApi;
-                pendingTokenConsumptionLog = true;
-                 // console.log(`[${extensionName}] Stored pre-calculated Prompt Tokens: ${promptTokens} for entity ${currentEntityId}. Setting pending flag to true.`);
-
-            } catch (error) {
-                console.error(`[${extensionName}] 在 GENERATE_AFTER_DATA 中计算 Token 时出错:`, error);
-                pendingTokenConsumptionLog = false;
-            }
+                lastCalculatedPromptTokens = promptTokens; lastUsedApi = currentApi; pendingTokenConsumptionLog = true;
+            } catch (error) { pendingTokenConsumptionLog = false; }
         });
-
-        // **修改：合并的 MESSAGE_RECEIVED 监听器**
-        // 处理 AI 回复消息的 Token/时长统计 和 确认 Prompt Token 消耗
         eventSource.on(event_types.MESSAGE_RECEIVED, (messageId, type) => {
             const context = getContext();
-
-            // 1. 处理 AI 回复消息的 Token 和 时长 统计
-            if (context && context.chat && context.chat[messageId]) {
-                 const message = context.chat[messageId];
-                 if (message && !message.is_user && !message.is_system) {
-                     handleMessage(message, false); // isUser = false
-                 }
-            }
-
-            // 2. 处理 Prompt Token 消耗确认
-            if (pendingTokenConsumptionLog) {
-                if (!currentEntityId) {
-                     console.warn(`[${extensionName}] MESSAGE_RECEIVED: Pending consumption log is true, but currentEntityId is null. Cannot record prompt tokens.`);
-                     pendingTokenConsumptionLog = false;
-                     lastCalculatedPromptTokens = 0;
-                     lastUsedApi = '';
-                     return;
-                }
-
-                const payload = {
-                    entityId: currentEntityId,
-                    entityName: currentEntityName,
-                    timestamp: Date.now(),
-                    promptTokenCount: lastCalculatedPromptTokens,
-                };
-                sendMessageToWorker('recordPromptTokens', payload);
-
-                pendingTokenConsumptionLog = false;
-                lastCalculatedPromptTokens = 0;
-                lastUsedApi = '';
+            if (context?.chat?.[messageId] && !context.chat[messageId].is_user && !context.chat[messageId].is_system) handleMessage(context.chat[messageId], false);
+            if (pendingTokenConsumptionLog && currentEntityId) {
+                sendMessageToWorker('recordPromptTokens', { entityId: currentEntityId, entityName: currentEntityName, timestamp: Date.now(), promptTokenCount: lastCalculatedPromptTokens });
+                pendingTokenConsumptionLog = false; lastCalculatedPromptTokens = 0;
             }
         });
+        eventSource.on(event_types.GENERATION_STOPPED, () => { if (pendingTokenConsumptionLog) { pendingTokenConsumptionLog = false; lastCalculatedPromptTokens = 0; } });
 
-        // **新增：监听生成停止 (GENERATION_STOPPED) - 用于取消未消耗的 Prompt Token**
-        eventSource.on(event_types.GENERATION_STOPPED, () => {
-            if (pendingTokenConsumptionLog) {
-                console.log(`[${extensionName}] GENERATION_STOPPED: Cancelling pending prompt token consumption log for entity ${currentEntityId}.`);
-                pendingTokenConsumptionLog = false;
-                lastCalculatedPromptTokens = 0;
-                lastUsedApi = '';
-            }
-        });
-
-        // 初始化时获取一次当前聊天上下文
+        // --- 添加 visibilitychange 监听器 ---
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        // --- 初始化时处理当前状态 ---
         onChatChanged(getContext()?.chatId);
+        if (document.visibilityState === 'visible') handleVisibilityChange();
 
-        console.log(`[${extensionName}] Main: Extension initialization complete. Event listeners registered.`);
+        console.log(`[${extensionName}] Main: Initialization complete.`);
     });
 
 })();
