@@ -6,8 +6,8 @@ import { getTokenCountAsync } from '../../../tokenizers.js';
 
 (function () {
     // --- 插件基础信息 ---
-    const extensionName = "day2";
-    const pluginFolderName = "day2";
+    const extensionName = "day5";
+    const pluginFolderName = "day5";
     const extensionFolderPath = `scripts/extensions/third-party/${pluginFolderName}`;
     const extensionSettings = extension_settings[extensionName] || {};
     const defaultSettings = {};
