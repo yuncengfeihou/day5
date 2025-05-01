@@ -11,15 +11,20 @@
             <table id="day1-stats-table" class="stats-table">
                 <thead>
                     <tr>
-                        <th>角色/群组</th>
-                        <th>用户消息 (Tokens)</th>
-                        <th>AI 消息 (Tokens)</th>
-                        <!-- 修改表头含义 -->
-                        <th>今日累计 Prompt Tokens</th>
-                        <th>日期</th>
-                        <th>角色/群组今日时长</th>
+                        <th>角色/群组</th>               <!-- Column 1 -->
+                        <th>用户消息 (Tokens)</th>     <!-- Column 2 -->
+                        <th>AI 消息 (Tokens)</th>      <!-- Column 3 -->
+                        <th>今日累计 Prompt Tokens</th> <!-- Column 4 -->
+                        <th>平均 AI 响应</th>         <!-- Column 5 (Was "日期") -->
+                        <th>今日交互时长</th>           <!-- Column 6 (Was "角色/群组今日时长") -->
+                        <th>总交互时长</th>             <!-- Column 7 (New) -->
+                        <th>今日总在线时长</th>         <!-- Column 8 (New) -->
                     </tr>
                 </thead>
+                <tbody id="day1-stats-table-body">
+                    <!-- 修改加载中/无数据时的 colspan -->
+                    <tr><td colspan="8"><i>加载中...</i></td></tr>
+                </tbody>
                 <tbody id="day1-stats-table-body">
                     <tr><td colspan="5"><i>加载中...</i></td></tr>
                 </tbody>
