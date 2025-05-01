@@ -1,4 +1,4 @@
-// 文件: public/extensions/third-party/day4/index.js
+// 文件: public/extensions/third-party/day5/index.js
 
 import { extension_settings, loadExtensionSettings, getContext, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
